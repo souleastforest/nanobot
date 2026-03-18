@@ -381,6 +381,27 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(("kimi-k2.5", {"temperature": 1.0}),),
     ),
+    # Kimi Coding Plan: uses Anthropic-compatible endpoint.
+    # Requires anthropic/ prefix and custom api_base.
+    ProviderSpec(
+        name="kimi_coding_plan",
+        keywords=("kimi-plan", "kimi-coding"),
+        env_key="ANTHROPIC_API_KEY",
+        display_name="Kimi Coding Plan",
+        litellm_prefix="anthropic",
+        skip_prefixes=("anthropic/",),
+        env_extras=(
+            ("ANTHROPIC_API_BASE", "{api_base}"),
+        ),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.kimi.com/coding",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.
     # Uses OpenAI-compatible API at api.minimax.io/v1.
     ProviderSpec(
@@ -396,6 +417,43 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="",
         default_api_base="https://api.minimax.io/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    # Mistral AI: OpenAI-compatible API at api.mistral.ai/v1.
+    ProviderSpec(
+        name="mistral",
+        keywords=("mistral",),
+        env_key="MISTRAL_API_KEY",
+        display_name="Mistral",
+        litellm_prefix="mistral",  # mistral-large-latest → mistral/mistral-large-latest
+        skip_prefixes=("mistral/",),  # avoid double-prefix
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.mistral.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    # MiniMax Coding Plan: uses Anthropic-compatible endpoint.
+    # Requires anthropic/ prefix and custom api_base.
+    ProviderSpec(
+        name="minimax_coding_plan",
+        keywords=("minimax-plan", "minimax-coding"),
+        env_key="ANTHROPIC_API_KEY",
+        display_name="MiniMax Coding Plan",
+        litellm_prefix="anthropic",
+        skip_prefixes=("anthropic/",),
+        env_extras=(
+            ("ANTHROPIC_API_BASE", "{api_base}"),
+        ),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="minimaxi",
+        default_api_base="https://api.minimaxi.com/anthropic",
         strip_model_prefix=False,
         model_overrides=(),
     ),
@@ -434,6 +492,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="http://localhost:11434",
         strip_model_prefix=False,
         model_overrides=(),
+    ),
+    # === OpenVINO Model Server (direct, local, OpenAI-compatible at /v3) ===
+    ProviderSpec(
+        name="ovms",
+        keywords=("openvino", "ovms"),
+        env_key="",
+        display_name="OpenVINO Model Server",
+        litellm_prefix="",
+        is_direct=True,
+        is_local=True,
+        default_api_base="http://localhost:8000/v3",
     ),
     # === Auxiliary (not a primary LLM provider) ============================
     # Groq: mainly used for Whisper voice transcription, also usable for LLM.

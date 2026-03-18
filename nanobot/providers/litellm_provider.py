@@ -12,7 +12,7 @@ from litellm import acompletion
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.providers.registry import find_by_model, find_gateway
+from nanobot.providers.registry import find_by_model, find_by_name, find_gateway
 
 # Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
@@ -48,11 +48,12 @@ class LiteLLMProvider(LLMProvider):
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
         # api_key / api_base are fallback for auto-detection.
+        self._provider_name = provider_name
         self._gateway = find_gateway(provider_name, api_key, api_base)
 
         # Configure environment variables
         if api_key:
-            self._setup_env(api_key, api_base, default_model)
+            self._setup_env(api_key, api_base, default_model, provider_name)
 
         if api_base:
             litellm.api_base = api_base
@@ -64,13 +65,22 @@ class LiteLLMProvider(LLMProvider):
 
         self._langsmith_enabled = bool(os.getenv("LANGSMITH_API_KEY"))
 
-    def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
+    def _setup_env(self, api_key: str, api_base: str | None, model: str, provider_name: str | None = None) -> None:
         """Set environment variables based on detected provider."""
-        spec = self._gateway or find_by_model(model)
+        # First try to find spec by provider_name, then gateway, then model-based lookup
+        spec = None
+        if provider_name:
+            spec = find_by_name(provider_name)
+            logger.debug("_setup_env: looking up spec by provider_name='{}', found={}", provider_name, spec.name if spec else None)
         if not spec:
+            spec = self._gateway or find_by_model(model)
+            logger.debug("_setup_env: fallback lookup, found={}", spec.name if spec else None)
+        if not spec:
+            logger.debug("_setup_env: no spec found!")
             return
         if not spec.env_key:
             # OAuth/provider-only specs (for example: openai_codex)
+            logger.debug("_setup_env: spec {} has no env_key, skipping", spec.name)
             return
 
         # Gateway/local overrides existing env; standard provider doesn't
@@ -83,28 +93,42 @@ class LiteLLMProvider(LLMProvider):
         #   {api_key}  → user's API key
         #   {api_base} → user's api_base, falling back to spec.default_api_base
         effective_base = api_base or spec.default_api_base
+        logger.debug("_setup_env: spec.env_extras={}, effective_base={}", spec.env_extras, effective_base)
         for env_name, env_val in spec.env_extras:
             resolved = env_val.replace("{api_key}", api_key)
-            resolved = resolved.replace("{api_base}", effective_base)
+            resolved = resolved.replace("{api_base}", effective_base or "")
             os.environ.setdefault(env_name, resolved)
+            logger.debug("_setup_env: set env {}={}", env_name, resolved)
 
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
+        original = model
         if self._gateway:
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix:
                 model = f"{prefix}/{model}"
+            logger.debug("_resolve_model(gateway): {} -> {}", original, model)
             return model
 
+        # Check if provider_name specifies a custom provider spec
+        spec = None
+        if self._provider_name:
+            spec = find_by_name(self._provider_name)
+            logger.debug("_resolve_model: provider_name='{}' -> spec={}", self._provider_name, spec.name if spec else None)
+
         # Standard mode: auto-prefix for known providers
-        spec = find_by_model(model)
+        if not spec:
+            spec = find_by_model(model)
+            logger.debug("_resolve_model: find_by_model -> spec={}", spec.name if spec else None)
         if spec and spec.litellm_prefix:
             model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
-            if not any(model.startswith(s) for s in spec.skip_prefixes):
+            skip = any(model.startswith(s) for s in spec.skip_prefixes)
+            logger.debug("_resolve_model: after canonicalize={}, skip_prefixes={}", model, skip)
+            if not skip:
                 model = f"{spec.litellm_prefix}/{model}"
-
+        logger.debug("_resolve_model: {} -> {}", original, model)
         return model
 
     @staticmethod
@@ -121,7 +145,12 @@ class LiteLLMProvider(LLMProvider):
         """Return True when the provider supports cache_control on content blocks."""
         if self._gateway is not None:
             return self._gateway.supports_prompt_caching
-        spec = find_by_model(model)
+        # Check provider_name spec first, then fall back to model-based lookup
+        spec = None
+        if self._provider_name:
+            spec = find_by_name(self._provider_name)
+        if not spec:
+            spec = find_by_model(model)
         return spec is not None and spec.supports_prompt_caching
 
     def _apply_cache_control(
@@ -153,7 +182,12 @@ class LiteLLMProvider(LLMProvider):
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
         model_lower = model.lower()
-        spec = find_by_model(model)
+        # Check provider_name spec first, then fall back to model-based lookup
+        spec = None
+        if self._provider_name:
+            spec = find_by_name(self._provider_name)
+        if not spec:
+            spec = find_by_model(model)
         if spec:
             for pattern, overrides in spec.model_overrides:
                 if pattern in model_lower:
@@ -276,6 +310,21 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        # DEBUG: Log the actual request
+        logger.debug(
+            "LiteLLM request: provider_name={}, original_model={}, resolved_model={}, api_base={}, "
+            "env[ANTHROPIC_API_BASE]={}, env[LITELLM_ANTHROPIC_DISABLE_URL_SUFFIX]={}",
+            self._provider_name,
+            original_model,
+            model,
+            kwargs.get("api_base", self.api_base),
+            os.environ.get("ANTHROPIC_API_BASE", "NOT_SET"),
+            os.environ.get("LITELLM_ANTHROPIC_DISABLE_URL_SUFFIX", "NOT_SET"),
+        )
+        # Log full kwargs for debugging (mask api_key)
+        # debug_kwargs = {k: v for k, v in kwargs.items() if k != "api_key"}
+        # logger.debug("LiteLLM kwargs: {}", debug_kwargs)
 
         try:
             response = await acompletion(**kwargs)
