@@ -87,6 +87,8 @@ class ProvidersConfig(Base):
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
+    kimi_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Coding Plan (Anthropic-compatible)
+    minimax_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Minimax Coding Plan (Anthropic-compatible)
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 

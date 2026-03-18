@@ -381,6 +381,27 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(("kimi-k2.5", {"temperature": 1.0}),),
     ),
+    # Kimi Coding Plan: uses Anthropic-compatible endpoint.
+    # Requires anthropic/ prefix and custom api_base.
+    ProviderSpec(
+        name="kimi_coding_plan",
+        keywords=("kimi-plan", "kimi-coding"),
+        env_key="ANTHROPIC_API_KEY",
+        display_name="Kimi Coding Plan",
+        litellm_prefix="anthropic",
+        skip_prefixes=("anthropic/",),
+        env_extras=(
+            ("ANTHROPIC_API_BASE", "{api_base}"),
+        ),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.kimi.com/coding",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.
     # Uses OpenAI-compatible API at api.minimax.io/v1.
     ProviderSpec(
@@ -413,6 +434,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="",
         default_api_base="https://api.mistral.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    # MiniMax Coding Plan: uses Anthropic-compatible endpoint.
+    # Requires anthropic/ prefix and custom api_base.
+    ProviderSpec(
+        name="minimax_coding_plan",
+        keywords=("minimax-plan", "minimax-coding"),
+        env_key="ANTHROPIC_API_KEY",
+        display_name="MiniMax Coding Plan",
+        litellm_prefix="anthropic",
+        skip_prefixes=("anthropic/",),
+        env_extras=(
+            ("ANTHROPIC_API_BASE", "{api_base}"),
+        ),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="minimaxi",
+        default_api_base="https://api.minimaxi.com/anthropic",
         strip_model_prefix=False,
         model_overrides=(),
     ),
