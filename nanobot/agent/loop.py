@@ -445,7 +445,12 @@ class AgentLoop:
             )
         if cmd == "/compress":
             success, message = await self.memory_consolidator.compress_session(session)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=message,
+                metadata=msg.metadata or {},
+            )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), msg.metadata)
