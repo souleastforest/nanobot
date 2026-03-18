@@ -355,3 +355,35 @@ class MemoryConsolidator:
                 estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:
                     return
+
+    async def compress_session(self, session: Session) -> tuple[bool, str]:
+        """Manually compress all unconsolidated messages in the session.
+
+        Returns (success, message) tuple with results for user feedback.
+        """
+        if not session.messages:
+            return False, "No messages to compress."
+
+        unconsolidated_count = len(session.messages) - session.last_consolidated
+        if unconsolidated_count <= 0:
+            return False, "No unconsolidated messages to compress."
+
+        lock = self.get_lock(session.key)
+        async with lock:
+            # Get all unconsolidated messages
+            chunk = session.messages[session.last_consolidated:]
+            if not chunk:
+                return False, "No messages to compress."
+
+            logger.info(
+                "Manual compression for {}: consolidating {} messages",
+                session.key,
+                len(chunk),
+            )
+
+            if await self.consolidate_messages(chunk):
+                session.last_consolidated = len(session.messages)
+                self.sessions.save(session)
+                return True, f"Compressed {len(chunk)} messages. Current session context reduced."
+            else:
+                return False, "Compression failed. Please try again later."

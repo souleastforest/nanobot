@@ -409,11 +409,15 @@ class AgentLoop:
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
+                "/compress — Compress current session messages",
                 "/help — Show available commands",
             ]
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
+        if cmd == "/compress":
+            success, message = await self.memory_consolidator.compress_session(session)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=message)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
