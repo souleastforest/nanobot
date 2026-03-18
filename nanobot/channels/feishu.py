@@ -394,8 +394,8 @@ class FeishuChannel(BaseChannel):
             return True
         return self._is_bot_mentioned(message)
 
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
+        """Sync helper for adding reaction (runs in thread pool). Returns reaction_id if successful."""
         from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
         try:
             request = CreateMessageReactionRequest.builder() \
@@ -410,22 +410,71 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
+                return None
             else:
-                logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                reaction_id = response.data.reaction_id if response.data else None
+                logger.debug("Added {} reaction to message {}, reaction_id={}", emoji_type, message_id, reaction_id)
+                return reaction_id
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
         Add a reaction emoji to a message (non-blocking).
 
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
+
+        Returns:
+            reaction_id if successful, None otherwise
         """
         if not self._client:
+            return None
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+
+    def _remove_reaction_sync(self, message_id: str, reaction_id: str) -> None:
+        """Sync helper for removing reaction (runs in thread pool)."""
+        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+        logger.debug("_remove_reaction_sync: starting for message_id={}, reaction_id={}", message_id, reaction_id)
+        try:
+            request = DeleteMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .reaction_id(reaction_id) \
+                .build()
+
+            logger.debug("_remove_reaction_sync: sending delete request for message_id={}, reaction_id={}", message_id, reaction_id)
+            response = self._client.im.v1.message_reaction.delete(request)
+
+            if not response.success():
+                logger.warning(
+                    "Failed to remove reaction: code={}, msg={}, message_id={}, reaction_id={}",
+                    response.code, response.msg, message_id, reaction_id
+                )
+            else:
+                logger.info("Successfully removed reaction_id={} from message {}", reaction_id, message_id)
+        except Exception as e:
+            logger.exception("Error removing reaction for message_id={}: {}", message_id, e)
+
+    async def _remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        """
+        Remove a reaction emoji from a message (non-blocking).
+
+        Args:
+            message_id: The message ID
+            reaction_id: The reaction ID returned from _add_reaction
+        """
+        logger.debug("_remove_reaction called: message_id={}, reaction_id={}, _client={}", message_id, reaction_id, self._client is not None)
+        if not self._client:
+            logger.warning("_remove_reaction: client not initialized, skipping")
+            return
+        if not reaction_id:
+            logger.warning("_remove_reaction: no reaction_id provided, skipping")
             return
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        await loop.run_in_executor(None, self._remove_reaction_sync, message_id, reaction_id)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -1022,8 +1071,32 @@ class FeishuChannel(BaseChannel):
                             "interactive", json.dumps(card, ensure_ascii=False),
                         )
 
+            # Remove processing reaction after reply is sent
+            original_message_id = msg.metadata.get("message_id")
+            reaction_id = msg.metadata.get("reaction_id")
+            logger.debug(
+                "Feishu send: attempting to remove reaction - original_message_id={}, reaction_id={}, metadata={}",
+                original_message_id, reaction_id, msg.metadata
+            )
+            if original_message_id and reaction_id:
+                logger.info("Feishu send: removing reaction_id={} from message {}", reaction_id, original_message_id)
+                await self._remove_reaction(original_message_id, reaction_id)
+            else:
+                logger.warning(
+                    "Feishu send: skip removing reaction - original_message_id={}, reaction_id={}",
+                    original_message_id, reaction_id
+                )
+
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
+            # Also remove reaction on error to avoid stuck emoji
+            original_message_id = msg.metadata.get("message_id")
+            reaction_id = msg.metadata.get("reaction_id")
+            if original_message_id and reaction_id:
+                try:
+                    await self._remove_reaction(original_message_id, reaction_id)
+                except Exception:
+                    pass
 
     def _on_message_sync(self, data: Any) -> None:
         """
@@ -1063,8 +1136,9 @@ class FeishuChannel(BaseChannel):
                 logger.debug("Feishu: skipping group message (not mentioned)")
                 return
 
-            # Add reaction
-            await self._add_reaction(message_id, self.config.react_emoji)
+            # Add reaction and store reaction_id for later removal
+            reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
+            logger.debug("Feishu _on_message: added reaction_id={} to message_id={}", reaction_id, message_id)
 
             # Parse content
             content_parts = []
@@ -1145,6 +1219,7 @@ class FeishuChannel(BaseChannel):
                     "msg_type": msg_type,
                     "parent_id": parent_id,
                     "root_id": root_id,
+                    "reaction_id": reaction_id,
                 }
             )
 
