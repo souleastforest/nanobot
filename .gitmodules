@@ -1,0 +1,4 @@
+[submodule "nanobot-profiles"]
+	path = nanobot-profiles
+	url = git@github.com:souleastforest/nanobot-profiles.git
+	branch = master
