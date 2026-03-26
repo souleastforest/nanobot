@@ -52,6 +52,11 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
+
+    # Preserve original message metadata (e.g., reaction_id for Feishu auto-removal)
+    meta = dict(ctx.msg.metadata or {})
+    meta["render_as"] = "text"
+
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -62,7 +67,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
         ),
-        metadata={"render_as": "text"},
+        metadata=meta,
     )
 
 
@@ -93,11 +98,16 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/compress — Compress session history",
         "/help — Show available commands",
     ]
+
+    # Preserve original message metadata (e.g., reaction_id for Feishu auto-removal)
+    meta = dict(ctx.msg.metadata or {})
+    meta["render_as"] = "text"
+
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content="\n".join(lines),
-        metadata={"render_as": "text"},
+        metadata=meta,
     )
 
 
@@ -108,11 +118,15 @@ async def cmd_compress(ctx: CommandContext) -> OutboundMessage:
 
     success, message = await loop.memory_consolidator.compress_session(session)
 
+    # Preserve original message metadata (e.g., reaction_id for Feishu auto-removal)
+    meta = dict(ctx.msg.metadata or {})
+    meta["render_as"] = "text"
+
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=message,
-        metadata={"render_as": "text"},
+        metadata=meta,
     )
 
 

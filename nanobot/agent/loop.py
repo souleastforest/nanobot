@@ -418,16 +418,19 @@ class AgentLoop:
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
+                    # Preserve channel-specific metadata (e.g., reaction_id for Feishu auto-removal)
+                    base_meta = {k: v for k, v in (msg.metadata or {}).items() if not k.startswith("_")}
+
                     async def on_stream(delta: str) -> None:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content=delta, metadata={"_stream_delta": True},
+                            content=delta, metadata={"_stream_delta": True, **base_meta},
                         ))
 
                     async def on_stream_end(*, resuming: bool = False) -> None:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata={"_stream_end": True, "_resuming": resuming},
+                            content="", metadata={"_stream_end": True, "_resuming": resuming, **base_meta},
                         ))
 
                 response = await self._process_message(

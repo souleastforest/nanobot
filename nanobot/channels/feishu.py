@@ -1094,6 +1094,12 @@ class FeishuChannel(BaseChannel):
         if meta.get("_stream_end"):
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
+                # Even if no content, try to remove reaction when stream ends
+                original_message_id = meta.get("message_id")
+                reaction_id = meta.get("reaction_id")
+                if original_message_id and reaction_id:
+                    logger.debug("send_delta: removing reaction after empty stream")
+                    await self._remove_reaction(original_message_id, reaction_id)
                 return
             if buf.card_id:
                 buf.sequence += 1
@@ -1109,6 +1115,16 @@ class FeishuChannel(BaseChannel):
                 for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                     card = json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
                     await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
+            # Remove processing reaction after stream ends and content is sent
+            original_message_id = meta.get("message_id")
+            reaction_id = meta.get("reaction_id")
+            logger.debug(
+                "send_delta: attempting to remove reaction after stream - message_id={}, reaction_id={}",
+                original_message_id, reaction_id
+            )
+            if original_message_id and reaction_id:
+                logger.info("send_delta: removing reaction_id={} from message {}", reaction_id, original_message_id)
+                await self._remove_reaction(original_message_id, reaction_id)
             return
 
         # --- accumulate delta ---
