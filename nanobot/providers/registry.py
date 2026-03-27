@@ -304,6 +304,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         default_api_base="https://api.minimaxi.com/anthropic",
     ),
+    # Zhipu GLM Coding Plan CN: Anthropic-compatible endpoint
+    ProviderSpec(
+        name="glm_cn_coding_plan",
+        keywords=("glm-coding-plan-cn", "glm-cn-coding"),
+        env_key="ANTHROPIC_API_KEY",
+        display_name="Zhipu GLM CN Coding Plan",
+        backend="anthropic",
+        default_api_base="https://open.bigmodel.cn/api/anthropic",
+    ),
     # === Local deployment (matched by config key, NOT by api_base) =========
     # vLLM / any OpenAI-compatible local server
     ProviderSpec(
