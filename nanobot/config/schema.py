@@ -28,6 +28,15 @@ class ChannelsConfig(Base):
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
 
 
+class DreamConfig(Base):
+    """Dream memory consolidation configuration."""
+
+    cron: str = "0 */2 * * *"  # Every 2 hours
+    model: str | None = None  # Override model for Dream
+    max_batch_size: int = Field(default=20, ge=1)  # Max history entries per run
+    max_iterations: int = Field(default=10, ge=1)  # Max tool calls per Phase 2
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -40,8 +49,9 @@ class AgentDefaults(Base):
     context_window_tokens: int = 65_536
     temperature: float = 0.1
     max_tool_iterations: int = 40
-    context_budget_tokens: int = 0  # Max old-history tokens during tool iterations (0 = no trim)
-    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
+    timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
 class AgentsConfig(Base):
@@ -77,17 +87,16 @@ class ProvidersConfig(Base):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
+    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
-    kimi_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Coding Plan (Anthropic-compatible)
-    minimax_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Minimax Coding Plan (Anthropic-compatible)
-    glm_cn_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Zhipu GLM Coding Plan CN (Anthropic-compatible)
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+    qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
 
 class HeartbeatConfig(Base):
@@ -96,6 +105,14 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
+
+
+class ApiConfig(Base):
+    """OpenAI-compatible API server configuration."""
+
+    host: str = "127.0.0.1"  # Safer default: local-only bind.
+    port: int = 8900
+    timeout: float = 120.0  # Per-request timeout in seconds.
 
 
 class GatewayConfig(Base):
@@ -131,14 +148,6 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
 
-
-class InputLimitsConfig(Base):
-    """Limits for user-provided multimodal inputs."""
-
-    max_input_images: int = 3
-    max_input_image_bytes: int = 10 * 1024 * 1024
-
-
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -156,7 +165,6 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    input_limits: InputLimitsConfig = Field(default_factory=InputLimitsConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -167,6 +175,7 @@ class Config(BaseSettings):
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 

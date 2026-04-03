@@ -50,8 +50,9 @@ class _FakeBot:
     async def set_my_commands(self, commands) -> None:
         self.commands = commands
 
-    async def send_message(self, **kwargs) -> None:
+    async def send_message(self, **kwargs):
         self.sent_messages.append(kwargs)
+        return SimpleNamespace(message_id=len(self.sent_messages))
 
     async def send_photo(self, **kwargs) -> None:
         self.sent_media.append({"kind": "photo", **kwargs})
@@ -280,6 +281,52 @@ async def test_send_text_gives_up_after_max_retries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_error_logs_network_issues_as_warning(monkeypatch) -> None:
+    from telegram.error import NetworkError
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    recorded: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.warning",
+        lambda message, error: recorded.append(("warning", message.format(error))),
+    )
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.error",
+        lambda message, error: recorded.append(("error", message.format(error))),
+    )
+
+    await channel._on_error(object(), SimpleNamespace(error=NetworkError("proxy disconnected")))
+
+    assert recorded == [("warning", "Telegram network issue: proxy disconnected")]
+
+
+@pytest.mark.asyncio
+async def test_on_error_keeps_non_network_exceptions_as_error(monkeypatch) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    recorded: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.warning",
+        lambda message, error: recorded.append(("warning", message.format(error))),
+    )
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.logger.error",
+        lambda message, error: recorded.append(("error", message.format(error))),
+    )
+
+    await channel._on_error(object(), SimpleNamespace(error=RuntimeError("boom")))
+
+    assert recorded == [("error", "Telegram error: boom")]
+
+
+@pytest.mark.asyncio
 async def test_send_delta_stream_end_raises_and_keeps_buffer_on_failure() -> None:
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
@@ -293,6 +340,62 @@ async def test_send_delta_stream_end_raises_and_keeps_buffer_on_failure() -> Non
         await channel.send_delta("123", "", {"_stream_end": True})
 
     assert "123" in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
+    channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
+
+    await channel.send_delta("123", "", {"_stream_end": True, "_stream_id": "s:0"})
+
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_send_delta_new_stream_id_replaces_stale_buffer() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="hello",
+        message_id=7,
+        last_edit=0.0,
+        stream_id="old:0",
+    )
+
+    await channel.send_delta("123", "world", {"_stream_delta": True, "_stream_id": "new:0"})
+
+    buf = channel._stream_bufs["123"]
+    assert buf.text == "world"
+    assert buf.stream_id == "new:0"
+    assert buf.message_id == 1
+
+
+@pytest.mark.asyncio
+async def test_send_delta_incremental_edit_treats_not_modified_as_success() -> None:
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
+    channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
+
+    await channel.send_delta("123", "", {"_stream_delta": True, "_stream_id": "s:0"})
+
+    assert channel._stream_bufs["123"].last_edit > 0.0
 
 
 def test_derive_topic_session_key_uses_thread_id() -> None:
@@ -544,43 +647,56 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
     assert channel._app.bot.get_me_calls == 0
 
 
-def test_extract_reply_context_no_reply() -> None:
+@pytest.mark.asyncio
+async def test_extract_reply_context_no_reply() -> None:
     """When there is no reply_to_message, _extract_reply_context returns None."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     message = SimpleNamespace(reply_to_message=None)
-    assert TelegramChannel._extract_reply_context(message) is None
+    assert await channel._extract_reply_context(message) is None
 
 
-def test_extract_reply_context_with_text() -> None:
+@pytest.mark.asyncio
+async def test_extract_reply_context_with_text() -> None:
     """When reply has text, return prefixed string."""
-    reply = SimpleNamespace(text="Hello world", caption=None)
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._app = _FakeApp(lambda: None)
+    reply = SimpleNamespace(text="Hello world", caption=None, from_user=SimpleNamespace(id=2, username="testuser", first_name="Test"))
     message = SimpleNamespace(reply_to_message=reply)
-    assert TelegramChannel._extract_reply_context(message) == "[Reply to: Hello world]"
+    assert await channel._extract_reply_context(message) == "[Reply to @testuser: Hello world]"
 
 
-def test_extract_reply_context_with_caption_only() -> None:
+@pytest.mark.asyncio
+async def test_extract_reply_context_with_caption_only() -> None:
     """When reply has only caption (no text), caption is used."""
-    reply = SimpleNamespace(text=None, caption="Photo caption")
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._app = _FakeApp(lambda: None)
+    reply = SimpleNamespace(text=None, caption="Photo caption", from_user=SimpleNamespace(id=2, username=None, first_name="Test"))
     message = SimpleNamespace(reply_to_message=reply)
-    assert TelegramChannel._extract_reply_context(message) == "[Reply to: Photo caption]"
+    assert await channel._extract_reply_context(message) == "[Reply to Test: Photo caption]"
 
 
-def test_extract_reply_context_truncation() -> None:
+@pytest.mark.asyncio
+async def test_extract_reply_context_truncation() -> None:
     """Reply text is truncated at TELEGRAM_REPLY_CONTEXT_MAX_LEN."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._app = _FakeApp(lambda: None)
     long_text = "x" * (TELEGRAM_REPLY_CONTEXT_MAX_LEN + 100)
-    reply = SimpleNamespace(text=long_text, caption=None)
+    reply = SimpleNamespace(text=long_text, caption=None, from_user=SimpleNamespace(id=2, username=None, first_name=None))
     message = SimpleNamespace(reply_to_message=reply)
-    result = TelegramChannel._extract_reply_context(message)
+    result = await channel._extract_reply_context(message)
     assert result is not None
     assert result.startswith("[Reply to: ")
     assert result.endswith("...]")
     assert len(result) == len("[Reply to: ]") + TELEGRAM_REPLY_CONTEXT_MAX_LEN + len("...")
 
 
-def test_extract_reply_context_no_text_returns_none() -> None:
+@pytest.mark.asyncio
+async def test_extract_reply_context_no_text_returns_none() -> None:
     """When reply has no text/caption, _extract_reply_context returns None (media handled separately)."""
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     reply = SimpleNamespace(text=None, caption=None)
     message = SimpleNamespace(reply_to_message=reply)
-    assert TelegramChannel._extract_reply_context(message) is None
+    assert await channel._extract_reply_context(message) is None
 
 
 @pytest.mark.asyncio
