@@ -76,3 +76,57 @@ class TestConsolidatorTokenBudget:
         consolidator.archive = AsyncMock(return_value=True)
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
+
+
+class TestCompressSession:
+    """Manual /compress vs automatic maybe_consolidate_by_tokens gates."""
+
+    async def test_maybe_idle_between_target_and_budget_compress_runs(
+        self, consolidator: Consolidator
+    ) -> None:
+        """Above half-budget target but below full budget: maybe skips, compress runs."""
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.context_window_tokens = 200_000
+        consolidator.max_completion_tokens = 100
+        session = MagicMock()
+        session.key = "test:key"
+        session.last_consolidated = 0
+        session.messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(150_000, "tiktoken"))
+        consolidator.pick_consolidation_boundary = MagicMock(return_value=(2, 100))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session)
+        consolidator.archive.assert_not_called()
+
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(150_000, "tiktoken"), (40_000, "tiktoken")]
+        )
+        consolidator.archive.reset_mock()
+
+        ok, msg = await consolidator.compress_session(session)
+        assert ok is True
+        consolidator.archive.assert_awaited_once()
+        assert "150000" in msg and "40000" in msg
+
+    async def test_compress_already_compact_skips_archive(self, consolidator: Consolidator) -> None:
+        """At or below half-budget target: compress reports idle and does not archive."""
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.context_window_tokens = 200_000
+        consolidator.max_completion_tokens = 100
+        session = MagicMock()
+        session.key = "test:key"
+        session.last_consolidated = 0
+        session.messages = [{"role": "user", "content": "hi"}]
+
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(50_000, "tiktoken"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        ok, msg = await consolidator.compress_session(session)
+        assert ok is False
+        assert "Already compact" in msg
+        consolidator.archive.assert_not_called()

@@ -341,6 +341,60 @@ class Consolidator:
             self.store.raw_archive(messages)
             return True
 
+    async def _consolidate_until_target(
+        self,
+        session: Session,
+        budget: int,
+        target: int,
+        initial_estimated: int,
+        initial_source: str,
+    ) -> tuple[int, int, str]:
+        """Archive rounds until estimated <= target or no progress.
+
+        Caller must hold ``get_lock(session.key)``. Returns
+        ``(rounds_completed, final_estimated, final_source)``.
+        """
+        estimated, source = initial_estimated, initial_source
+        rounds = 0
+        for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
+            if estimated <= target:
+                return rounds, estimated, source
+
+            boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+            if boundary is None:
+                logger.debug(
+                    "Token consolidation: no safe boundary for {} (round {})",
+                    session.key,
+                    round_num,
+                )
+                return rounds, estimated, source
+
+            end_idx = boundary[0]
+            chunk = session.messages[session.last_consolidated:end_idx]
+            if not chunk:
+                return rounds, estimated, source
+
+            logger.info(
+                "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
+                round_num,
+                session.key,
+                estimated,
+                self.context_window_tokens,
+                source,
+                len(chunk),
+            )
+            if not await self.archive(chunk):
+                return rounds, estimated, source
+            session.last_consolidated = end_idx
+            self.sessions.save(session)
+            rounds += 1
+
+            estimated, source = self.estimate_session_prompt_tokens(session)
+            if estimated <= 0:
+                return rounds, estimated, source
+
+        return rounds, estimated, source
+
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -367,41 +421,45 @@ class Consolidator:
                 )
                 return
 
-            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
-                    return
+            await self._consolidate_until_target(session, budget, target, estimated, source)
 
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
-                        session.key,
-                        round_num,
-                    )
-                    return
+    async def compress_session(self, session: Session) -> tuple[bool, str]:
+        """User-initiated: archive toward half-budget target when still above it.
 
-                end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
-                if not chunk:
-                    return
+        Unlike :meth:`maybe_consolidate_by_tokens`, this runs when
+        ``estimated > target`` even if the prompt is below the full ``budget``,
+        so manual ``/compress`` can free context before hitting the limit.
+        """
+        if not session.messages:
+            return False, "No messages to compress."
+        if self.context_window_tokens <= 0:
+            return False, "Context window is not configured."
 
-                logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                    round_num,
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    len(chunk),
+        lock = self.get_lock(session.key)
+        async with lock:
+            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+            target = budget // 2
+            estimated_before, source = self.estimate_session_prompt_tokens(session)
+            if estimated_before <= 0:
+                return False, "Could not estimate prompt size."
+            if estimated_before <= target:
+                return (
+                    False,
+                    f"Already compact ({estimated_before} tokens, target ≤ {target}).",
                 )
-                if not await self.archive(chunk):
-                    return
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
 
-                estimated, source = self.estimate_session_prompt_tokens(session)
-                if estimated <= 0:
-                    return
+            rounds, estimated_after, _ = await self._consolidate_until_target(
+                session, budget, target, estimated_before, source
+            )
+            if rounds == 0:
+                return (
+                    False,
+                    "Could not compress: no safe boundary to archive (or nothing to archive).",
+                )
+            return (
+                True,
+                f"Compressed {rounds} round(s). Estimated tokens: {estimated_before} → {estimated_after}.",
+            )
 
 
 # ---------------------------------------------------------------------------

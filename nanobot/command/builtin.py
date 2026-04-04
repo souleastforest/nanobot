@@ -204,6 +204,7 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/compress — Compress session history",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -211,12 +212,30 @@ def build_help_text() -> str:
     ]
     return "\n".join(lines)
 
+async def cmd_compress(ctx: CommandContext) -> OutboundMessage:
+    """Compress/consolidate session messages to reduce context size."""
+    loop = ctx.loop
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+
+    _, message = await loop.consolidator.compress_session(session)
+
+    # Preserve original message metadata (e.g., reaction_id for Feishu auto-removal)
+    meta = dict(ctx.msg.metadata or {})
+    meta["render_as"] = "text"
+
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=message,
+        metadata=meta,
+    )
 
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
+    router.priority("/compress", cmd_compress)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/dream", cmd_dream)
