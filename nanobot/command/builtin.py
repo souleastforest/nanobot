@@ -10,6 +10,7 @@ from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
+from nanobot.utils.restart import set_restart_notice_to_env
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
@@ -35,6 +36,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
+    set_restart_notice_to_env(channel=msg.channel, chat_id=msg.chat_id)
 
     async def _do_restart():
         await asyncio.sleep(1)
@@ -58,6 +60,20 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
+    
+    # Fetch web search provider usage (best-effort, never blocks the response)
+    search_usage_text: str | None = None
+    try:
+        from nanobot.utils.searchusage import fetch_search_usage
+        web_cfg = getattr(loop, "web_config", None)
+        search_cfg = getattr(web_cfg, "search", None) if web_cfg else None
+        if search_cfg is not None:
+            provider = getattr(search_cfg, "provider", "duckduckgo")
+            api_key = getattr(search_cfg, "api_key", "") or None
+            usage = await fetch_search_usage(provider=provider, api_key=api_key)
+            search_usage_text = usage.format()
+    except Exception:
+        pass  # Never let usage fetch break /status
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -67,6 +83,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
+            search_usage_text=search_usage_text,
         ),
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
@@ -91,15 +108,103 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     """Manually trigger a Dream consolidation run."""
+    import time
+
     loop = ctx.loop
-    try:
-        did_work = await loop.dream.run()
-        content = "Dream completed." if did_work else "Dream: nothing to process."
-    except Exception as e:
-        content = f"Dream failed: {e}"
+    msg = ctx.msg
+
+    async def _run_dream():
+        t0 = time.monotonic()
+        try:
+            did_work = await loop.dream.run()
+            elapsed = time.monotonic() - t0
+            if did_work:
+                content = f"Dream completed in {elapsed:.1f}s."
+            else:
+                content = "Dream: nothing to process."
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            content = f"Dream failed after {elapsed:.1f}s: {e}"
+        await loop.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    asyncio.create_task(_run_dream())
     return OutboundMessage(
-        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
+        channel=msg.channel, chat_id=msg.chat_id, content="Dreaming...",
     )
+
+
+def _extract_changed_files(diff: str) -> list[str]:
+    """Extract changed file paths from a unified diff."""
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        path = parts[3]
+        if path.startswith("b/"):
+            path = path[2:]
+        if path in seen:
+            continue
+        seen.add(path)
+        files.append(path)
+    return files
+
+
+def _format_changed_files(diff: str) -> str:
+    files = _extract_changed_files(diff)
+    if not files:
+        return "No tracked memory files changed."
+    return ", ".join(f"`{path}`" for path in files)
+
+
+def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = None) -> str:
+    files_line = _format_changed_files(diff)
+    lines = [
+        "## Dream Update",
+        "",
+        "Here is the selected Dream memory change." if requested_sha else "Here is the latest Dream memory change.",
+        "",
+        f"- Commit: `{commit.sha}`",
+        f"- Time: {commit.timestamp}",
+        f"- Changed files: {files_line}",
+    ]
+    if diff:
+        lines.extend([
+            "",
+            f"Use `/dream-restore {commit.sha}` to undo this change.",
+            "",
+            "```diff",
+            diff.rstrip(),
+            "```",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Dream recorded this version, but there is no file diff to display.",
+        ])
+    return "\n".join(lines)
+
+
+def _format_dream_restore_list(commits: list) -> str:
+    lines = [
+        "## Dream Restore",
+        "",
+        "Choose a Dream memory version to restore. Latest first:",
+        "",
+    ]
+    for c in commits:
+        lines.append(f"- `{c.sha}` {c.timestamp} - {c.message.splitlines()[0]}")
+    lines.extend([
+        "",
+        "Preview a version with `/dream-log <sha>` before restoring it.",
+        "Restore a version with `/dream-restore <sha>`.",
+    ])
+    return "\n".join(lines)
 
 
 async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
@@ -113,9 +218,9 @@ async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
 
     if not git.is_initialized():
         if store.get_last_dream_cursor() == 0:
-            msg = "Dream has not run yet."
+            msg = "Dream has not run yet. Run `/dream`, or wait for the next scheduled Dream cycle."
         else:
-            msg = "Git not initialized for memory files."
+            msg = "Dream history is not available because memory versioning is not initialized."
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content=msg, metadata={"render_as": "text"},
@@ -128,18 +233,23 @@ async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
         sha = args.split()[0]
         result = git.show_commit_diff(sha)
         if not result:
-            content = f"Commit `{sha}` not found."
+            content = (
+                f"Couldn't find Dream change `{sha}`.\n\n"
+                "Use `/dream-restore` to list recent versions, "
+                "or `/dream-log` to inspect the latest one."
+            )
         else:
             commit, diff = result
-            content = commit.format(diff)
+            content = _format_dream_log_content(commit, diff, requested_sha=sha)
     else:
         # Default: show the latest commit's diff
-        result = git.show_commit_diff(git.log(max_entries=1)[0].sha) if git.log(max_entries=1) else None
+        commits = git.log(max_entries=1)
+        result = git.show_commit_diff(commits[0].sha) if commits else None
         if result:
             commit, diff = result
-            content = commit.format(diff)
+            content = _format_dream_log_content(commit, diff)
         else:
-            content = "No commits yet."
+            content = "Dream memory has no saved versions yet."
 
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
@@ -159,7 +269,7 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
     if not git.is_initialized():
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="Git not initialized for memory files.",
+            content="Dream history is not available because memory versioning is not initialized.",
         )
 
     args = ctx.args.strip()
@@ -167,19 +277,26 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
         # Show recent commits for the user to pick
         commits = git.log(max_entries=10)
         if not commits:
-            content = "No commits found."
+            content = "Dream memory has no saved versions to restore yet."
         else:
-            lines = ["## Recent Dream Commits\n", "Use `/dream-restore <sha>` to revert a commit.\n"]
-            for c in commits:
-                lines.append(f"- `{c.sha}` {c.message.splitlines()[0]} ({c.timestamp})")
-            content = "\n".join(lines)
+            content = _format_dream_restore_list(commits)
     else:
         sha = args.split()[0]
+        result = git.show_commit_diff(sha)
+        changed_files = _format_changed_files(result[1]) if result else "the tracked memory files"
         new_sha = git.revert(sha)
         if new_sha:
-            content = f"Reverted commit `{sha}` → new commit `{new_sha}`."
+            content = (
+                f"Restored Dream memory to the state before `{sha}`.\n\n"
+                f"- New safety commit: `{new_sha}`\n"
+                f"- Restored files: {changed_files}\n\n"
+                f"Use `/dream-log {new_sha}` to inspect the restore diff."
+            )
         else:
-            content = f"Failed to revert commit `{sha}`. Check if the SHA is correct."
+            content = (
+                f"Couldn't restore Dream change `{sha}`.\n\n"
+                "It may not exist, or it may be the first saved version with no earlier state to restore."
+            )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=content, metadata={"render_as": "text"},
@@ -212,6 +329,7 @@ def build_help_text() -> str:
     ]
     return "\n".join(lines)
 
+
 async def cmd_compress(ctx: CommandContext) -> OutboundMessage:
     """Compress/consolidate session messages to reduce context size."""
     loop = ctx.loop
@@ -229,6 +347,7 @@ async def cmd_compress(ctx: CommandContext) -> OutboundMessage:
         content=message,
         metadata=meta,
     )
+
 
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
