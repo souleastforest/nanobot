@@ -21,5 +21,15 @@ if ! command -v nanobot &> /dev/null; then
     exit 1
 fi
 
+# Avoid shell-exported Claude/Anthropic vars from contaminating nanobot's own provider config.
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_MODEL
+unset ANTHROPIC_SMALL_FAST_MODEL
+unset ANTHROPIC_DEFAULT_SONNET_MODEL
+unset ANTHROPIC_DEFAULT_OPUS_MODEL
+unset ANTHROPIC_DEFAULT_HAIKU_MODEL
+
 # 执行
 nanobot gateway --workspace nanobot-profiles/.nanobot-oblivionis-001/workspace --config ./nanobot-profiles/.nanobot-oblivionis-001/config.json

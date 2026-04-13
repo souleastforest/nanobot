@@ -50,7 +50,23 @@ class AnthropicProvider(LLMProvider):
             client_kw["default_headers"] = extra_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
-        self._client = AsyncAnthropic(**client_kw)
+
+        # When explicit config is provided, don't let shell-exported ANTHROPIC_* vars
+        # inject a conflicting auth_token/base_url into the SDK client.
+        scrub_env_names: set[str] = set()
+        if api_key is not None:
+            scrub_env_names.update({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
+        if api_base is not None:
+            scrub_env_names.add("ANTHROPIC_BASE_URL")
+
+        scrubbed_env: dict[str, str] = {}
+        for env_name in scrub_env_names:
+            if env_name in os.environ:
+                scrubbed_env[env_name] = os.environ.pop(env_name)
+        try:
+            self._client = AsyncAnthropic(**client_kw)
+        finally:
+            os.environ.update(scrubbed_env)
 
     @classmethod
     def _handle_error(cls, e: Exception) -> LLMResponse:
