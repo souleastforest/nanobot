@@ -104,8 +104,8 @@ class TestConsolidatorTokenBudget:
         assert archived_chunk[-1]["content"] == "m49"
         assert session.last_consolidated == 50
 
-    async def test_chunk_cap_skips_when_no_user_boundary_within_cap(self, consolidator):
-        """If the cap would cut mid-turn, consolidation should skip that round."""
+    async def test_chunk_cap_falls_back_when_no_user_boundary(self, consolidator):
+        """When no user-turn boundary exists within cap, fall back to any boundary."""
         consolidator._SAFETY_BUFFER = 0
         session = MagicMock()
         session.last_consolidated = 0
@@ -117,11 +117,54 @@ class TestConsolidatorTokenBudget:
             }
             for i in range(70)
         ]
-        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(1200, "tiktoken"))
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (400, "tiktoken")]
+        )
         consolidator.pick_consolidation_boundary = MagicMock(return_value=(61, 999))
         consolidator.archive = AsyncMock(return_value=True)
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
-        consolidator.archive.assert_not_awaited()
-        assert session.last_consolidated == 0
+        # Falls back to capped_end (60) when no user boundary within cap
+        archived_chunk = consolidator.archive.await_args_list[0].args[0]
+        assert len(archived_chunk) == 60
+        assert session.last_consolidated == 60
+
+
+class TestConsolidatorPickBoundary:
+    async def test_prefers_user_turn_boundary(self, consolidator):
+        """pick_consolidation_boundary prefers user-turn boundaries."""
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "how are you"},
+            {"role": "assistant", "content": "fine"},
+        ]
+        boundary = consolidator.pick_consolidation_boundary(session, 1)
+        assert boundary is not None
+        assert boundary[0] == 2  # first user-turn after start
+
+    async def test_falls_back_to_any_boundary_without_user_turns(self, consolidator):
+        """When no user-turn exists after start, fall back to any message boundary."""
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "assistant", "content": "a3"},
+        ]
+        boundary = consolidator.pick_consolidation_boundary(session, 1)
+        assert boundary is not None
+        # No user turns after index 0, so fallback to last non-start message
+        assert boundary[0] == 3
+
+    async def test_returns_none_when_all_consolidated(self, consolidator):
+        """Returns None when last_consolidated >= len(messages)."""
+        session = MagicMock()
+        session.last_consolidated = 5
+        session.messages = [{"role": "user", "content": "hi"}] * 3
+        boundary = consolidator.pick_consolidation_boundary(session, 100)
+        assert boundary is None

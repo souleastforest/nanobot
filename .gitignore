@@ -88,3 +88,4 @@ temp/
 # Local tooling
 _bmad
 .claude
+$NOVEL_DIR

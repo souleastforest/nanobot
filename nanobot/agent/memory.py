@@ -383,38 +383,47 @@ class Consolidator:
         session: Session,
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
+        """Pick a boundary that removes enough old prompt tokens.
+
+        Prefers user-turn boundaries for coherence, but falls back to any
+        message boundary when no user turn exists in the remaining messages
+        (e.g. long tool-call chains).
+        """
         start = session.last_consolidated
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
 
         removed_tokens = 0
         last_boundary: tuple[int, int] | None = None
+        last_fallback: tuple[int, int] | None = None
         for idx in range(start, len(session.messages)):
             message = session.messages[idx]
-            if idx > start and message.get("role") == "user":
-                last_boundary = (idx, removed_tokens)
-                if removed_tokens >= tokens_to_remove:
-                    return last_boundary
+            if idx > start:
+                last_fallback = (idx, removed_tokens)
+                if message.get("role") == "user":
+                    last_boundary = (idx, removed_tokens)
+                    if removed_tokens >= tokens_to_remove:
+                        return last_boundary
             removed_tokens += estimate_message_tokens(message)
 
-        return last_boundary
+        return last_boundary or last_fallback
 
     def _cap_consolidation_boundary(
         self,
         session: Session,
         end_idx: int,
     ) -> int | None:
-        """Clamp the chunk size without breaking the user-turn boundary."""
+        """Clamp the chunk size, preferring user-turn boundaries."""
         start = session.last_consolidated
         if end_idx - start <= self._MAX_CHUNK_MESSAGES:
             return end_idx
 
-        capped_end = start + self._MAX_CHUNK_MESSAGES
+        capped_end = min(start + self._MAX_CHUNK_MESSAGES, len(session.messages))
         for idx in range(capped_end, start, -1):
             if session.messages[idx].get("role") == "user":
                 return idx
-        return None
+        # Fallback: use any boundary within the cap rather than failing.
+        return capped_end
 
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
