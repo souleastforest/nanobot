@@ -258,6 +258,7 @@ class FeishuConfig(Base):
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
+_STREAM_MAX_SECONDS = 540.0  # 9 min — recycle before the 10-min hard limit
 
 
 @dataclass
@@ -268,6 +269,8 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    started_at: float = 0.0  # monotonic time when streaming card was created
+    stream_expired: bool = False  # True after 300309 — no more streaming updates
 
 
 class FeishuChannel(BaseChannel):
@@ -1203,8 +1206,12 @@ class FeishuChannel(BaseChannel):
             logger.warning("Error creating streaming card: {}", e)
             return None
 
-    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
-        """Stream-update the markdown element on a CardKit card (typewriter effect)."""
+    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool | str:
+        """Stream-update the markdown element on a CardKit card (typewriter effect).
+
+        Returns True on success, False on generic failure, or the string "expired"
+        when Feishu returns error code 300309 (streaming mode auto-closed).
+        """
         from lark_oapi.api.cardkit.v1 import (
             ContentCardElementRequest,
             ContentCardElementRequestBody,
@@ -1225,6 +1232,11 @@ class FeishuChannel(BaseChannel):
             )
             response = self._client.cardkit.v1.card_element.content(request)
             if not response.success():
+                if response.code == 300309:
+                    logger.warning(
+                        "Streaming mode expired for card {} (10-min limit)", card_id
+                    )
+                    return "expired"
                 logger.warning(
                     "Failed to stream-update card {}: code={}, msg={}",
                     card_id,
@@ -1306,11 +1318,13 @@ class FeishuChannel(BaseChannel):
                 # Flush current text to card but keep the buffer alive so the
                 # next segment appends to the same card.
                 buf = self._stream_bufs.get(chat_id)
-                if buf and buf.card_id and buf.text:
+                if buf and buf.card_id and buf.text and not buf.stream_expired:
                     buf.sequence += 1
-                    await loop.run_in_executor(
+                    result = await loop.run_in_executor(
                         None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence,
                     )
+                    if result == "expired":
+                        buf.stream_expired = True
                 return
 
             buf = self._stream_bufs.pop(chat_id, None)
@@ -1322,7 +1336,7 @@ class FeishuChannel(BaseChannel):
                     logger.debug("send_delta: removing reaction after empty stream")
                     await self._remove_reaction(original_message_id, reaction_id)
                 return
-            if buf.card_id:
+            if buf.card_id and not buf.stream_expired:
                 buf.sequence += 1
                 await loop.run_in_executor(
                     None,
@@ -1339,6 +1353,25 @@ class FeishuChannel(BaseChannel):
                     buf.card_id,
                     buf.sequence,
                 )
+            elif buf.stream_expired and buf.text:
+                # Streaming mode timed out — send accumulated text as regular message.
+                logger.info("send_delta: streaming expired, sending {} chars as regular message", len(buf.text))
+                for chunk in self._split_elements_by_table_limit(
+                    self._build_card_elements(buf.text)
+                ):
+                    card = json.dumps(
+                        {"config": {"wide_screen_mode": True}, "elements": chunk},
+                        ensure_ascii=False,
+                    )
+                    await loop.run_in_executor(
+                        None, self._send_message_sync, rid_type, chat_id, "interactive", card
+                    )
+                # Best-effort cleanup of the dead streaming card
+                if buf.card_id:
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
+                    )
             else:
                 for chunk in self._split_elements_by_table_limit(
                     self._build_card_elements(buf.text)
@@ -1371,6 +1404,10 @@ class FeishuChannel(BaseChannel):
         if not buf.text.strip():
             return
 
+        # If streaming already expired, just accumulate silently.
+        if buf.stream_expired:
+            return
+
         now = time.monotonic()
         if buf.card_id is None:
             card_id = await loop.run_in_executor(
@@ -1378,16 +1415,38 @@ class FeishuChannel(BaseChannel):
             )
             if card_id:
                 buf.card_id = card_id
+                buf.started_at = now
                 buf.sequence = 1
                 await loop.run_in_executor(
                     None, self._stream_update_text_sync, card_id, buf.text, 1
                 )
                 buf.last_edit = now
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+            # Proactive card recycling: close current card and create a fresh
+            # one before the 10-minute hard limit expires.
+            if buf.started_at and (now - buf.started_at) >= _STREAM_MAX_SECONDS:
+                logger.info(
+                    "send_delta: recycling streaming card {} after {:.0f}s (limit {}s)",
+                    buf.card_id, now - buf.started_at, _STREAM_MAX_SECONDS,
+                )
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
+                )
+                # Reset so the create-card path below fires on the *next* delta.
+                # (We can't create + update in one shot because the throttling
+                # guard already passed, and we want to avoid double-sending.)
+                buf.card_id = None
+                buf.sequence = 0
+                buf.started_at = 0.0
+                return
+
             buf.sequence += 1
-            await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence
             )
+            if result == "expired":
+                buf.stream_expired = True
             buf.last_edit = now
 
     async def send(self, msg: OutboundMessage) -> None:
