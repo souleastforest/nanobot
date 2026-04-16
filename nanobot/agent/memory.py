@@ -268,8 +268,12 @@ class MemoryStore:
                     line = line.strip()
                     if line:
                         try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
+                            entry = json.loads(line)
+                            # Normalize cursor to int — it may have been stored as str.
+                            if "cursor" in entry and not isinstance(entry["cursor"], int):
+                                entry["cursor"] = int(entry["cursor"])
+                            entries.append(entry)
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             continue
         except FileNotFoundError:
             pass
