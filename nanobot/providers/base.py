@@ -1,18 +1,53 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
 import asyncio
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, cast
 
+import json_repair
 from loguru import logger
 
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import sanitize_surrogates_deep
+
+STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
+DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
+MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
+RETRY_AFTER_BUFFER = 1
+
+
+def resolve_stream_idle_timeout_s(
+    *,
+    env_value: str | None = None,
+    default: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
+    maximum: float = MAX_STREAM_IDLE_TIMEOUT_S,
+) -> float:
+    """Return a safe streaming idle timeout from env/config text."""
+    raw = os.environ.get(STREAM_IDLE_TIMEOUT_ENV) if env_value is None else env_value
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid {}={!r}; using {}", STREAM_IDLE_TIMEOUT_ENV, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive {}={!r}; using {}", STREAM_IDLE_TIMEOUT_ENV, raw, default)
+        return default
+    if value > maximum:
+        logger.warning("Clamping {}={!r} to {}", STREAM_IDLE_TIMEOUT_ENV, raw, maximum)
+        return maximum
+    return value
 
 
 @dataclass
@@ -20,19 +55,37 @@ class ToolCallRequest:
     """A tool call request from the LLM."""
     id: str
     name: str
-    arguments: dict[str, Any]
+    arguments: Any
     extra_content: dict[str, Any] | None = None
     provider_specific_fields: dict[str, Any] | None = None
     function_provider_specific_fields: dict[str, Any] | None = None
 
+    def has_valid_name(self) -> bool:
+        """Whether this call carries a usable (non-empty string) tool name.
+
+        ToolCallRequest.name is typed ``str`` but not enforced at runtime: a
+        model/gateway can emit a degenerate call with ``name=None`` or ``""``.
+        Such a call cannot be executed and, if persisted and replayed, makes
+        upstream APIs reject the whole request (e.g. Anthropic-style
+        ``messages.content.N.tool_use.name: Input should be a valid string``),
+        which permanently wedges the session.
+        """
+        runtime_name = cast(object, self.name)
+        return isinstance(runtime_name, str) and bool(runtime_name)
+
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
-        tool_call = {
+        arguments = (
+            self.arguments
+            if isinstance(self.arguments, str)
+            else json.dumps(self.arguments, ensure_ascii=False)
+        )
+        tool_call: dict[str, Any] = {
             "id": self.id,
             "type": "function",
             "function": {
                 "name": self.name,
-                "arguments": json.dumps(self.arguments, ensure_ascii=False),
+                "arguments": arguments,
             },
         }
         if self.extra_content:
@@ -44,6 +97,160 @@ class ToolCallRequest:
         return tool_call
 
 
+def parse_tool_arguments(arguments: Any) -> Any:
+    """Parse provider tool arguments without guessing executable parameters.
+
+    Valid JSON object strings become dicts. Empty strings become no-arg calls.
+    Malformed JSON and JSON array/scalar values are preserved so ToolRegistry
+    can reject them before execution.
+    """
+    if arguments is None:
+        return {}
+    if not isinstance(arguments, str):
+        return arguments
+
+    stripped = arguments.strip()
+    if not stripped:
+        return {}
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return arguments
+    return arguments if parsed is None else parsed
+
+
+def tool_arguments_object_for_replay(arguments: Any) -> dict[str, Any]:
+    """Return object-shaped arguments for provider history replay only.
+
+    This compatibility path may repair malformed JSON because it only shapes
+    existing conversation history for provider protocols. Do not use it for
+    newly generated tool calls that are about to execute.
+    """
+    if arguments is None:
+        return {}
+    if isinstance(arguments, dict):
+        return cast(dict[str, Any], arguments)
+    if not isinstance(arguments, str):
+        return {}
+
+    stripped = arguments.strip()
+    if not stripped:
+        return {}
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        try:
+            parsed = json_repair.loads(stripped)
+        except Exception:
+            return {}
+    return cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {}
+
+
+def tool_arguments_json_for_replay(arguments: Any) -> str:
+    """Return JSON object string arguments for provider history replay only."""
+    return json.dumps(tool_arguments_object_for_replay(arguments), ensure_ascii=False)
+
+
+@dataclass
+class ProviderConversationState:
+    """Opaque provider-owned continuation state.
+
+    ``payload`` may contain encrypted reasoning or other provider-private
+    protocol items. Keep it out of normal logs and public chat history.
+    ``pending_messages`` are Chat-style messages produced after the most
+    recent provider response and are materialized by the owning provider on
+    the next request.
+    """
+
+    kind: str
+    provider: str
+    model: str
+    version: int
+    payload: dict[str, Any] = field(default_factory=dict, repr=False)
+    pending_messages: list[dict[str, Any]] = field(default_factory=list, repr=False)
+
+    def with_pending_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> ProviderConversationState:
+        """Return a state copy with an isolated pending-message list."""
+        return ProviderConversationState(
+            kind=self.kind,
+            provider=self.provider,
+            model=self.model,
+            version=self.version,
+            payload=self.payload,
+            pending_messages=deepcopy(messages),
+        )
+
+    def to_private_record(self) -> dict[str, Any]:
+        """Serialize for the private session sidecar, never for public history."""
+        return {
+            "kind": self.kind,
+            "provider": self.provider,
+            "model": self.model,
+            "version": self.version,
+            "payload": deepcopy(self.payload),
+            "pending_messages": deepcopy(self.pending_messages),
+        }
+
+    @classmethod
+    def from_private_record(
+        cls,
+        value: object,
+    ) -> ProviderConversationState | None:
+        """Validate and deserialize a private session-sidecar value."""
+        if not isinstance(value, dict):
+            return None
+        data = cast(dict[str, Any], value)
+        kind = data.get("kind")
+        provider = data.get("provider")
+        model = data.get("model")
+        version = data.get("version")
+        payload = data.get("payload")
+        pending = data.get("pending_messages", [])
+        if (
+            not isinstance(kind, str)
+            or not kind
+            or not isinstance(provider, str)
+            or not provider
+            or not isinstance(model, str)
+            or not model
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or not isinstance(payload, dict)
+            or not isinstance(pending, list)
+            or any(
+                not isinstance(message, dict)
+                for message in cast(list[object], pending)
+            )
+        ):
+            return None
+        return cls(
+            kind=kind,
+            provider=provider,
+            model=model,
+            version=version,
+            payload=deepcopy(cast(dict[str, Any], payload)),
+            pending_messages=deepcopy(cast(list[dict[str, Any]], pending)),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderCallContext:
+    """Optional provider-owned continuation data for one model request.
+
+    The regular ``chat`` contract stays provider-agnostic. Responses-capable
+    providers consume this context through the opt-in ``chat_with_context``
+    hooks, while every other provider inherits the context-free delegation.
+    """
+
+    conversation_state: ProviderConversationState | None = field(default=None, repr=False)
+    context_window_tokens: int | None = None
+
+
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
@@ -53,7 +260,11 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     retry_after: float | None = None  # Provider supplied retry wait in seconds.
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
-    thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
+    thinking_blocks: list[dict[str, Any]] | None = None  # Anthropic extended thinking
+    provider_state: ProviderConversationState | None = field(default=None, repr=False)
+    # Routing wrappers may preserve or discard an incoming provider-owned
+    # continuation independently of the final fallback error's retry policy.
+    preserve_provider_state_on_error: bool | None = field(default=None, repr=False)
     # Structured error metadata used by retry policy when finish_reason == "error".
     error_status_code: int | None = None
     error_kind: str | None = None  # e.g. "timeout", "connection"
@@ -67,6 +278,14 @@ class LLMResponse:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
 
+    @property
+    def should_execute_tools(self) -> bool:
+        """Tools execute only when has_tool_calls AND finish_reason is a tool-capable stop.
+        Blocks gateway-injected calls under ``refusal`` / ``content_filter`` / ``error`` (#3220)."""
+        if not self.has_tool_calls:
+            return False
+        return self.finish_reason in ("tool_calls", "function_call", "stop")
+
 
 @dataclass(frozen=True)
 class GenerationSettings:
@@ -77,8 +296,13 @@ class GenerationSettings:
     reasoning_effort: str | None = None
 
 
+_SYNTHETIC_USER_CONTENT = "(conversation continued)"
+
+
 class LLMProvider(ABC):
     """Base class for LLM providers."""
+
+    supports_progress_deltas = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
@@ -97,6 +321,8 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+        "速率限制",
+        "访问量过大",
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
@@ -143,6 +369,7 @@ class LLMProvider(ABC):
         "temporarily unavailable",
         "overloaded",
         "concurrency limit",
+        "速率限制",
     )
 
     _SENTINEL = object()
@@ -152,11 +379,32 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
 
+    def can_resume_conversation_state(
+        self,
+        state: ProviderConversationState,
+        model: str | None = None,
+    ) -> bool:
+        """Whether this provider can safely consume an opaque saved state."""
+        return False
+
+    def supports_native_compaction(self, model: str | None = None) -> bool:
+        """Whether requests may include provider-native context compaction."""
+        return False
+
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Sanitize message content: fix empty blocks, strip internal _meta fields."""
+        """Sanitize message content: fix empty blocks, strip internal _meta fields.
+
+        Also strips unpaired UTF-16 surrogate code points from every string leaf
+        as a defense-in-depth pass before the payload leaves the process. Lone
+        surrogates (e.g. leaking from a Windows console, prompt_toolkit history,
+        or a truncated JSON round-trip) otherwise cause ``UnicodeEncodeError:
+        'utf-8' codec can't encode characters ... surrogates not allowed`` when
+        the HTTP client serializes the request body.
+        """
         result: list[dict[str, Any]] = []
-        for msg in messages:
+        for raw_msg in messages:
+            msg = {key: value for key, value in raw_msg.items() if key != "_meta"}
             content = msg.get("content")
 
             if isinstance(content, str) and not content:
@@ -168,19 +416,20 @@ class LLMProvider(ABC):
             if isinstance(content, list):
                 new_items: list[Any] = []
                 changed = False
-                for item in content:
+                for raw_item in cast(list[object], content):
+                    item = cast(dict[str, Any], raw_item) if isinstance(raw_item, dict) else None
                     if (
-                        isinstance(item, dict)
+                        item is not None
                         and item.get("type") in ("text", "input_text", "output_text")
                         and not item.get("text")
                     ):
                         changed = True
                         continue
-                    if isinstance(item, dict) and "_meta" in item:
+                    if item is not None and "_meta" in item:
                         new_items.append({k: v for k, v in item.items() if k != "_meta"})
                         changed = True
                     else:
-                        new_items.append(item)
+                        new_items.append(raw_item)
                 if changed:
                     clean = dict(msg)
                     if new_items:
@@ -199,7 +448,10 @@ class LLMProvider(ABC):
                 continue
 
             result.append(msg)
-        return result
+        # Defense-in-depth: scrub lone UTF-16 surrogates from every string leaf.
+        # This is idempotent and no-op when messages are already clean.
+        sanitized = sanitize_surrogates_deep(result)
+        return cast(list[dict[str, Any]], sanitized) if isinstance(sanitized, list) else result
 
     @staticmethod
     def _tool_name(tool: dict[str, Any]) -> str:
@@ -208,8 +460,9 @@ class LLMProvider(ABC):
         if isinstance(name, str):
             return name
         fn = tool.get("function")
-        if isinstance(fn, dict):
-            fname = fn.get("name")
+        fn_object = cast(dict[str, Any], fn) if isinstance(fn, dict) else None
+        if fn_object is not None:
+            fname = fn_object.get("name")
             if isinstance(fname, str):
                 return fname
         return ""
@@ -239,7 +492,7 @@ class LLMProvider(ABC):
         allowed_keys: frozenset[str],
     ) -> list[dict[str, Any]]:
         """Keep only provider-safe message keys and normalize assistant content."""
-        sanitized = []
+        sanitized: list[dict[str, Any]] = []
         for msg in messages:
             clean = {k: v for k, v in msg.items() if k in allowed_keys}
             if clean.get("role") == "assistant" and "content" not in clean:
@@ -280,7 +533,7 @@ class LLMProvider(ABC):
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     @classmethod
-    def _is_transient_response(cls, response: LLMResponse) -> bool:
+    def is_transient_response(cls, response: LLMResponse) -> bool:
         """Prefer structured error metadata, fallback to text markers for legacy providers."""
         if response.error_should_retry is not None:
             return bool(response.error_should_retry)
@@ -298,6 +551,29 @@ class LLMProvider(ABC):
 
         return cls._is_transient_error(response.content)
 
+    @classmethod
+    def is_arrearage_response(cls, response: LLMResponse) -> bool:
+        """Detect API-key arrearage / quota / billing errors that won't clear on retry.
+
+        These surface as HTTP 402 or as billing semantic tokens (e.g.
+        ``insufficient_quota``, ``payment_required``); reuses the same token and
+        text markers the 429 retry policy treats as non-retryable.
+        """
+        if response.error_status_code is not None and int(response.error_status_code) == 402:
+            return True
+
+        type_token = cls._normalize_error_token(response.error_type)
+        code_token = cls._normalize_error_token(response.error_code)
+        if any(
+            token in cls._NON_RETRYABLE_429_ERROR_TOKENS
+            for token in (type_token, code_token)
+            if token is not None
+        ):
+            return True
+
+        content = (response.content or "").lower()
+        return any(marker in content for marker in cls._NON_RETRYABLE_429_TEXT_MARKERS)
+
     @staticmethod
     def _normalize_error_token(value: Any) -> str | None:
         if value is None:
@@ -309,7 +585,7 @@ class LLMProvider(ABC):
     def _extract_error_type_code(cls, payload: Any) -> tuple[str | None, str | None]:
         data: dict[str, Any] | None = None
         if isinstance(payload, dict):
-            data = payload
+            data = cast(dict[str, Any], payload)
         elif isinstance(payload, str):
             text = payload.strip()
             if text:
@@ -318,16 +594,17 @@ class LLMProvider(ABC):
                 except Exception:
                     parsed = None
                 if isinstance(parsed, dict):
-                    data = parsed
-        if not isinstance(data, dict):
+                    data = cast(dict[str, Any], parsed)
+        if data is None:
             return None, None
 
         error_obj = data.get("error")
         type_value = data.get("type")
         code_value = data.get("code")
-        if isinstance(error_obj, dict):
-            type_value = error_obj.get("type") or type_value
-            code_value = error_obj.get("code") or code_value
+        error_object = cast(dict[str, Any], error_obj) if isinstance(error_obj, dict) else None
+        if error_object is not None:
+            type_value = error_object.get("type") or type_value
+            code_value = error_object.get("code") or code_value
 
         return cls._normalize_error_token(type_value), cls._normalize_error_token(code_value)
 
@@ -392,8 +669,33 @@ class LLMProvider(ABC):
             else:
                 merged.append(dict(msg))
 
+        last_popped = None
         while merged and merged[-1].get("role") == "assistant":
-            merged.pop()
+            last_popped = merged.pop()
+
+        # If removing trailing assistant messages left only system messages,
+        # the request would be invalid for most providers (e.g. Zhipu/GLM
+        # error 1214).  Recover by converting the last popped assistant
+        # message to a user message so the LLM can still see the content.
+        if (
+            merged
+            and last_popped is not None
+            and not any(m.get("role") in ("user", "tool") for m in merged)
+        ):
+            recovered = dict(last_popped)
+            recovered["role"] = "user"
+            merged.append(recovered)
+
+        # Safety net: ensure the first non-system message is not a bare
+        # ``assistant`` message.  Providers like GLM reject system→assistant
+        # with error 1214.  This can happen when upstream truncation (e.g.
+        # _snip_history) drops the only user message.  Insert a synthetic
+        # user message to keep the sequence valid.
+        for i, msg in enumerate(merged):
+            if msg.get("role") != "system":
+                if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                    merged.insert(i, {"role": "user", "content": _SYNTHETIC_USER_CONTENT})
+                break
 
         return merged
 
@@ -401,27 +703,74 @@ class LLMProvider(ABC):
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
         found = False
-        result = []
+        result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
             if isinstance(content, list):
-                new_content = []
-                for b in content:
-                    if isinstance(b, dict) and b.get("type") == "image_url":
-                        path = (b.get("_meta") or {}).get("path", "")
-                        placeholder = image_placeholder_text(path, empty="[image omitted]")
+                new_content: list[Any] = []
+                for raw_block in cast(list[object], content):
+                    block = cast(dict[str, Any], raw_block) if isinstance(raw_block, dict) else None
+                    if block is not None and block.get("type") == "image_url":
+                        placeholder = (
+                            "[Image not delivered to model — "
+                            "do not describe or reference it]"
+                        )
                         new_content.append({"type": "text", "text": placeholder})
                         found = True
                     else:
-                        new_content.append(b)
+                        new_content.append(raw_block)
                 result.append({**msg, "content": new_content})
             else:
                 result.append(msg)
         return result if found else None
 
+    @staticmethod
+    def _contains_image_content(value: object) -> bool:
+        """Return whether a JSON-like provider payload contains an input image."""
+        if isinstance(value, dict):
+            mapping = cast(dict[str, object], value)
+            if mapping.get("type") in {"image_url", "input_image"}:
+                return True
+            return any(LLMProvider._contains_image_content(item) for item in mapping.values())
+        if isinstance(value, list):
+            return any(
+                LLMProvider._contains_image_content(item)
+                for item in cast(list[object], value)
+            )
+        return False
+
+    @staticmethod
+    def _strip_image_content_inplace(messages: list[dict[str, Any]]) -> bool:
+        """Replace image_url blocks with text placeholder *in-place*.
+
+        Mutates the content lists of the original message dicts so that
+        callers holding references to those dicts also see the stripped
+        version.
+        """
+        found = False
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for i, raw_block in enumerate(cast(list[object], content)):
+                    block = cast(dict[str, Any], raw_block) if isinstance(raw_block, dict) else None
+                    if block is not None and block.get("type") == "image_url":
+                        placeholder = (
+                            "[Image not delivered to model — "
+                            "do not describe or reference it]"
+                        )
+                        content[i] = {"type": "text", "text": placeholder}
+                        found = True
+        return found
+
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
         try:
+            provider_context = kwargs.pop("provider_context", None)
+            if isinstance(provider_context, ProviderCallContext):
+                return await self.chat_with_context(
+                    provider_context=provider_context,
+                    **kwargs,
+                )
             return await self.chat(**kwargs)
         except asyncio.CancelledError:
             raise
@@ -438,26 +787,64 @@ class LLMProvider(ABC):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Stream a chat completion, calling *on_content_delta* for each text chunk.
+
+        *on_thinking_delta* is reserved for providers that expose incremental
+        thinking/reasoning on the wire; the default fallback invokes neither
+        callback for native deltas (only the optional single *on_content_delta*
+        after :meth:`chat`).
 
         Returns the same ``LLMResponse`` as :meth:`chat`.  The default
         implementation falls back to a non-streaming call and delivers the
         full content as a single delta.  Providers that support native
         streaming should override this method.
         """
+        _ = on_thinking_delta, on_tool_call_delta
         response = await self.chat(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
         if on_content_delta and response.content:
             await on_content_delta(response.content)
         return response
 
+    async def chat_with_context(
+        self,
+        *,
+        provider_context: ProviderCallContext,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Opt-in continuation hook; ordinary providers delegate to ``chat``."""
+        _ = provider_context
+        return await self.chat(**kwargs)
+
+    async def chat_stream_with_context(
+        self,
+        *,
+        provider_context: ProviderCallContext,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Streaming continuation hook with a context-free default."""
+        _ = provider_context
+        return await self.chat_stream(**kwargs)
+
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
         """Call chat_stream() and convert unexpected exceptions to error responses."""
         try:
+            provider_context = kwargs.pop("provider_context", None)
+            if isinstance(provider_context, ProviderCallContext):
+                return await self.chat_stream_with_context(
+                    provider_context=provider_context,
+                    **kwargs,
+                )
             return await self.chat_stream(**kwargs)
         except asyncio.CancelledError:
             raise
@@ -474,29 +861,56 @@ class LLMProvider(ABC):
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_stream_recover: Callable[[], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
-        if max_tokens is self._SENTINEL:
+        if max_tokens is self._SENTINEL or max_tokens is None:
             max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
+        if temperature is self._SENTINEL or temperature is None:
             temperature = self.generation.temperature
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
+
+        has_streamed_content = False
+
+        async def _tracking_delta(text: str) -> None:
+            nonlocal has_streamed_content
+            if text:
+                has_streamed_content = True
+            if on_content_delta:
+                await on_content_delta(text)
+
+        async def _recover_stream() -> None:
+            nonlocal has_streamed_content
+            if on_stream_recover:
+                await on_stream_recover()
+            has_streamed_content = False
 
         kw: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
-            on_content_delta=on_content_delta,
+            on_content_delta=_tracking_delta if on_content_delta is not None else None,
+            on_thinking_delta=on_thinking_delta,
+            on_tool_call_delta=on_tool_call_delta,
         )
+        if provider_context is not None:
+            kw["provider_context"] = provider_context
+        if on_stream_recover and getattr(self, "supports_stream_recover_callback", False):
+            kw["on_stream_recover"] = _recover_stream
         return await self._run_with_retry(
             self._safe_chat_stream,
             kw,
             messages,
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
+            should_retry_guard=lambda: not has_streamed_content,
+            on_stream_recover=_recover_stream if on_stream_recover else None,
         )
 
     async def chat_with_retry(
@@ -510,16 +924,20 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
         Parameters default to ``self.generation`` when not explicitly passed,
         so callers no longer need to thread temperature / max_tokens /
-        reasoning_effort through every layer.
+        reasoning_effort through every layer. Explicit ``None`` is also
+        normalized to the provider's generation defaults so that downstream
+        ``_build_kwargs`` never sees ``None`` for ``max_tokens`` / ``temperature``
+        (which would crash ``max(1, max_tokens)``).
         """
-        if max_tokens is self._SENTINEL:
+        if max_tokens is self._SENTINEL or max_tokens is None:
             max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
+        if temperature is self._SENTINEL or temperature is None:
             temperature = self.generation.temperature
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
@@ -529,6 +947,8 @@ class LLMProvider(ABC):
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        if provider_context is not None:
+            kw["provider_context"] = provider_context
         return await self._run_with_retry(
             self._safe_chat,
             kw,
@@ -575,19 +995,17 @@ class LLMProvider(ABC):
                 if value is not None:
                     return value
             if isinstance(headers, dict):
-                for key, value in headers.items():
+                for key, value in cast(dict[object, Any], headers).items():
                     if isinstance(key, str) and key.lower() == name.lower():
                         return value
             return None
 
-        try:
+        with suppress(TypeError, ValueError):
             retry_ms = _header_value("retry-after-ms")
             if retry_ms is not None:
                 value = float(retry_ms) / 1000.0
                 if value > 0:
                     return value
-        except (TypeError, ValueError):
-            pass
 
         retry_after = _header_value("retry-after")
         if retry_after is None:
@@ -642,6 +1060,8 @@ class LLMProvider(ABC):
         *,
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
+        should_retry_guard: Callable[[], bool] | None = None,
+        on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
@@ -655,6 +1075,30 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
             last_response = response
+            if should_retry_guard is not None and not should_retry_guard():
+                is_timeout = (response.error_kind or "").lower() == "timeout"
+                if is_timeout:
+                    if on_stream_recover:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "starting a new stream segment and retrying"
+                        )
+                        await on_stream_recover()
+                    else:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "suppressing delta callbacks and retrying"
+                        )
+                        kw.setdefault("on_content_delta", None)
+                        kw["on_content_delta"] = None
+                        kw["on_thinking_delta"] = None
+                        kw["on_tool_call_delta"] = None
+                        should_retry_guard = None
+                else:
+                    logger.warning(
+                        "LLM stream failed after content was emitted; skipping retry"
+                    )
+                    return response
             error_key = ((response.content or "").strip().lower() or None)
             if error_key and error_key == last_error_key:
                 identical_error_count += 1
@@ -662,15 +1106,39 @@ class LLMProvider(ABC):
                 last_error_key = error_key
                 identical_error_count = 1 if error_key else 0
 
-            if not self._is_transient_response(response):
-                stripped = self._strip_image_content(original_messages)
-                if stripped is not None and stripped != kw["messages"]:
+            if not self.is_transient_response(response):
+                stripped = self._strip_image_content(kw["messages"])
+                provider_context = kw.get("provider_context")
+                stripped_context: ProviderCallContext | None = None
+                if isinstance(provider_context, ProviderCallContext):
+                    state = provider_context.conversation_state
+                    if state is not None and (
+                        stripped is not None
+                        or self._strip_image_content(state.pending_messages) is not None
+                        or self._contains_image_content(state.payload)
+                    ):
+                        # Provider-owned payloads may retain earlier input_image items.
+                        # Rebuild from the stripped public transcript for this retry.
+                        stripped_context = ProviderCallContext(
+                            context_window_tokens=(
+                                provider_context.context_window_tokens
+                            ),
+                        )
+                if stripped is not None or stripped_context is not None:
                     logger.warning(
                         "Non-transient LLM error with image content, retrying without images"
                     )
                     retry_kw = dict(kw)
-                    retry_kw["messages"] = stripped
-                    return await call(**retry_kw)
+                    if stripped is not None:
+                        retry_kw["messages"] = stripped
+                    if stripped_context is not None:
+                        retry_kw["provider_context"] = stripped_context
+                    result = await call(**retry_kw)
+                    # Permanently strip images from the original messages so
+                    # subsequent iterations do not repeat the error-retry cycle.
+                    if result.finish_reason != "error":
+                        self._strip_image_content_inplace(original_messages)
+                    return result
                 return response
 
             if persistent and identical_error_count >= self._PERSISTENT_IDENTICAL_ERROR_LIMIT:
@@ -679,13 +1147,27 @@ class LLMProvider(ABC):
                     identical_error_count,
                     (response.content or "")[:120].lower(),
                 )
+                if on_retry_wait:
+                    await on_retry_wait(
+                        f"Persistent retry stopped after {identical_error_count} identical errors."
+                    )
                 return response
 
             if not persistent and attempt > len(delays):
+                logger.warning(
+                    "LLM request failed after {} retries, giving up: {}",
+                    attempt,
+                    (response.content or "")[:120].lower(),
+                )
+                if on_retry_wait:
+                    await on_retry_wait(
+                        f"Model request failed after {attempt} retries, giving up."
+                    )
                 break
 
+            retry_after = self._extract_retry_after_from_response(response)
             base_delay = delays[min(attempt - 1, len(delays) - 1)]
-            delay = self._extract_retry_after_from_response(response) or base_delay
+            delay = retry_after + RETRY_AFTER_BUFFER if retry_after else base_delay
             if persistent:
                 delay = min(delay, self._PERSISTENT_MAX_DELAY)
 
@@ -703,7 +1185,7 @@ class LLMProvider(ABC):
                 on_retry_wait=on_retry_wait,
             )
 
-        return last_response if last_response is not None else await call(**kw)
+        return last_response if last_response is not None else await call(**kw)  # pyright: ignore[reportUnnecessaryComparison]
 
     @abstractmethod
     def get_default_model(self) -> str:
